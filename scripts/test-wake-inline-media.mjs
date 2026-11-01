@@ -62,7 +62,7 @@ await test('带图新消息唤醒：图片内联进 prompt，并给出「已附�
   });
 });
 
-await test('同一条图不会在下一轮唤醒里重复附图（modelSeenSeqs 生效）', async () => {
+await test('同一条图不会在下一轮唤醒里重复附图（inlineMediaSeqs 回执生效）', async () => {
   await withBridge(async (h) => {
     append(h, '[图片]', IMG_MEDIA);
     await h.deliverPrompt(KEY, '', { wakeReason: 'atMention@seq1' });
@@ -70,6 +70,28 @@ await test('同一条图不会在下一轮唤醒里重复附图（modelSeenSeqs 
     await h.deliverPrompt(KEY, '', { wakeReason: 'probability@seq1' });
     assert.equal(imageBlocks(h).length, 0, '已展示过的图不应重复内联');
     assert.doesNotMatch(promptText(h), /【本次唤醒已附图】/);
+  });
+});
+
+await test('文本已通过工具展示过但图没附过：唤醒仍要附图（2026-11-01 事故回归）', async () => {
+  await withBridge(async (h) => {
+    // 事故链路：图片在回合中由 qq_wait_for_messages 以文本元数据返回，消息被记为
+    // modelSeenSeqs；如果唤醒附图也拿 modelSeenSeqs 判断，就会跳过附图，模型永远看不到图。
+    const seq = append(h, '[图片]', IMG_MEDIA);
+    h.getSocialV2State(KEY).modelSeenSeqs.add(seq);
+    await h.deliverPrompt(KEY, '', { wakeReason: 'atMention@seq1' });
+    assert.equal(imageBlocks(h).length, 1, '文本看过 ≠ 图看过，仍然必须附图');
+    assert.match(promptText(h), /【本次唤醒已附图】/);
+  });
+});
+
+await test('唤醒提示包含工具失败止损规则（连续失败 2 次就停）', async () => {
+  await withBridge(async (h) => {
+    append(h, '在吗');
+    const prompt = h.buildWakePromptV2(KEY, 'atMention@seq1');
+    assert.match(prompt, /【工具失败止损】/);
+    assert.match(prompt, /连续失败 2 次就停/);
+    assert.match(prompt, /图我这边打不开，你文字说一下/);
   });
 });
 
@@ -101,6 +123,11 @@ await test('图片抓取失败不连累唤醒：仍投递纯文本', async () =>
     assert.equal(imageBlocks(h).length, 0);
     assert.equal(lastPromptContent(h)[0]?.type, 'text');
     assert.doesNotMatch(promptText(h), /【本次唤醒已附图】/, '没有图片时不能声称已附图');
+    // 抓取失败不能记成“已内联附图”：恢复网关后，下一轮唤醒必须重试附图。
+    delete h.bot.getImage;
+    await h.deliverPrompt(KEY, '', { wakeReason: 'probability@seq1' });
+    assert.equal(imageBlocks(h).length, 1, '上一轮附图失败不允许吞掉重试机会');
+    assert.match(promptText(h), /【本次唤醒已附图】/);
   } finally { await h.close(); }
 });
 

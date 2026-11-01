@@ -9204,6 +9204,7 @@ async function main() {
         lastUnreadSeq: 0,
         lastReadThroughSeq: 0,
         modelSeenSeqs: new Set(),
+        inlineMediaSeqs: [],
         activeTopics: [],
         pendingThoughts: [],
         memberImpressions: {}
@@ -9275,6 +9276,10 @@ async function main() {
             lastReadThroughSeq: Number.isSafeInteger(val.lastReadThroughSeq) && val.lastReadThroughSeq >= 0
               ? Math.min(val.lastReadThroughSeq, Number(val.lastUnreadSeq) || 0) : 0,
             modelSeenSeqs: new Set(),
+            // 「图片已内联给模型」的回执：与 modelSeenSeqs（文本已展示）分开，
+            // 因为文本被工具返回过 ≠ 图片字节给过模型（见 collectWakeMediaV2 注释）。
+            inlineMediaSeqs: Array.isArray(val.inlineMediaSeqs)
+              ? val.inlineMediaSeqs.filter((seq) => Number.isSafeInteger(seq) && seq > 0) : [],
             activeTopics: Array.isArray(val.activeTopics) ? val.activeTopics : [],
             pendingThoughts: Array.isArray(val.pendingThoughts) ? val.pendingThoughts : [],
             memberImpressions: (() => {
@@ -9362,6 +9367,7 @@ async function main() {
           preSleepWaitAccumMs: st.preSleepWaitAccumMs || 0,
           lastUnreadSeq: st.lastUnreadSeq || 0,
           lastReadThroughSeq: st.lastReadThroughSeq || 0,
+          inlineMediaSeqs: (Array.isArray(st.inlineMediaSeqs) ? st.inlineMediaSeqs : []).slice(-100),
           activeTopics: Array.isArray(st.activeTopics) ? st.activeTopics.slice(-50) : [],
           pendingThoughts: Array.isArray(st.pendingThoughts) ? st.pendingThoughts.slice(-50) : [],
           memberImpressions: st.memberImpressions && typeof st.memberImpressions === 'object' ? st.memberImpressions : {},
@@ -9912,6 +9918,8 @@ async function main() {
     let wakeSnapshot;
     // 唤醒附图的来源：普通投递用调用方给的媒体列表；reserved2 唤醒则从新消息里兜底收集。
     let mediaForPrompt = Array.isArray(opts.media) ? opts.media : [];
+    // 本次实际挑中、准备内联的消息 seq，投递被接受后才记为“已内联附图”。
+    let inlineMediaSeqs = [];
     if (opts.wakeReason) {
       if (wakeBlocked()) return skipWake();
       // Build only after session creation: retries may rotate the token, and an
@@ -9924,7 +9932,11 @@ async function main() {
         promptText += `\n\n【本次消息快照】\n${JSON.stringify(wakeSnapshot)}\n以上消息已提供，无需重复查询；partial=true 时用 qq_get_unread_messages(afterSeq=readThroughSeq) 继续读取。先处理当前消息；回复前如需确认后续补充，用 qq_wait_for_messages(purpose="reply") 补足短静默，已安静够久会立即返回，不要先长等。收尾只确认你已处理的 readThroughSeq（本地 seq，非 QQ messageId），传给 qq_mark_read 或 qq_set_wake_config 的 throughSeq；新到消息留待处理。`;
         // 看图工具的参数会被某些模型传坏（-32602），唤醒时把新消息图片直接内联一份作兜底。
         // 只在调用方没给媒体时生效，避免重复附图。
-        if (mediaForPrompt.length === 0) mediaForPrompt = collectWakeMediaV2(key, wakeSnapshot);
+        if (mediaForPrompt.length === 0) {
+          const picked = collectWakeMediaV2(key, wakeSnapshot);
+          mediaForPrompt = picked.media;
+          inlineMediaSeqs = picked.seqs;
+        }
       }
     }
     let imageParts = [];
@@ -9968,6 +9980,12 @@ async function main() {
       // Acceptance grants visibility, never acknowledgement. New arrivals and
       // rejected/stale deliveries must not be cleared by an old cursor.
       noteModelMessagesV2(wakeState, [...wakeSnapshot.messages, ...wakeSnapshot.recent]);
+      // 只有投递被接受（图片确实会进入上下文）才记“已内联附图”：
+      // 全部抓取失败或被拒时不记，下一轮唤醒还能重试。
+      if (attachedCount > 0 && inlineMediaSeqs.length > 0) {
+        noteInlineMediaSeqsV2(wakeState, inlineMediaSeqs);
+        saveSocialV2State();
+      }
     }
     if (accepted.result.value.command?.text && !opts.silent && currentMode !== 'reserved2') {
       if (opts.farewell) social.exitingSessions.delete(sessionId);
@@ -11002,6 +11020,18 @@ async function main() {
     return readThroughSeqV2(st);
   }
 
+  // 「图片已经真的内联进 prompt 给模型看过」的独立回执，只用于避免重复附图，不参与已读水位。
+  // 不能用 modelSeenSeqs 代替：那个标记只说明文本被展示过（unread/wait 工具返回也算），
+  // 不代表图片字节给过模型 —— 2026-11-01 实证：图在回合中被 wait 工具以文本返回后，
+  // 下一次唤醒因“已看过”跳过附图，模型永远看不到图，只能对着坏工具重试 45 次。
+  function noteInlineMediaSeqsV2(st, seqs) {
+    if (!st || !Array.isArray(seqs) || seqs.length === 0) return;
+    const unread = new Set((Array.isArray(st.unread) ? st.unread : []).map((m) => m.seq));
+    const merged = new Set((Array.isArray(st.inlineMediaSeqs) ? st.inlineMediaSeqs : []).filter((seq) => unread.has(seq)));
+    for (const seq of seqs) if (unread.has(seq)) merged.add(seq);
+    st.inlineMediaSeqs = [...merged];
+  }
+
   function requestedReadThroughSeqV2(st, body, isAgent) {
     if (!Object.prototype.hasOwnProperty.call(body, 'throughSeq')) return null;
     const seq = body.throughSeq;
@@ -11025,6 +11055,11 @@ async function main() {
       st.lastReadThroughSeq = Math.max(st.lastReadThroughSeq || 0, throughSeq);
     }
     noteModelMessagesV2(st, []);
+    // 附图回执只保留仍在未读里的消息，避免状态文件无限增长。
+    if (Array.isArray(st.inlineMediaSeqs)) {
+      const unread = new Set(st.unread.map((m) => m.seq));
+      st.inlineMediaSeqs = st.inlineMediaSeqs.filter((seq) => unread.has(seq));
+    }
     return before - st.unread.length;
   }
 
@@ -11164,37 +11199,47 @@ async function main() {
 
   // reserved2 的唤醒只给「文本快照 + 看图工具」，图片完全依赖 qq_get_message_images。
   // 实测某些模型/网关会把该工具的 messageId 参数传坏（MCP -32602 Input validation error），
-  // 此时看图链路整条断掉，模型只能对群友说"看不见图"。这里把**本次快照里、模型还没看过**
+  // 此时看图链路整条断掉，模型只能对群友说"看不见图"。这里把**本次快照里、图片还没内联过**
   // 的新消息图片直接内联进唤醒 prompt，作为不依赖工具参数的兜底。
   //
   // 边界：
   //   · 只取 snapshot.messages（本次真正展示给模型的那批未读），不含 recent，避免翻旧账重复烧图；
-  //   · 已在 modelSeenSeqs 里的消息跳过 —— 那是上一轮已经连图一起展示过的，不能每轮重发；
+  //   · 用独立回执 inlineMediaSeqs 判断“图是否已经附过”，**不用 modelSeenSeqs**：
+  //     文本被 wait/unread 工具返回过不等于图片给过模型（2026-11-01 事故根因）；
   //   · 总量受 socialV2.media.maxCount 约束（默认 5 张），单条消息内的多图共享这个额度；
   //   · socialV2.media.inlineWake=false 可整体关闭（回滚开关，不改代码）。
+  // 返回 { media, seqs }：seqs 是本次实际挑中、待附图的消息 seq，投递被接受后才记账。
   function collectWakeMediaV2(key, snapshot) {
-    if (!snapshot || !Array.isArray(snapshot.messages) || snapshot.messages.length === 0) return [];
-    if (cfg.socialV2?.media?.inlineWake === false) return [];
+    const empty = { media: [], seqs: [] };
+    if (!snapshot || !Array.isArray(snapshot.messages) || snapshot.messages.length === 0) return empty;
+    if (cfg.socialV2?.media?.inlineWake === false) return empty;
     const st = getSocialV2State(key);
-    if (!st) return [];
-    const seen = new Set(st.modelSeenSeqs || []);
+    if (!st) return empty;
     const unreadBySeq = new Map();
     for (const msg of Array.isArray(st.unread) ? st.unread : []) {
       if (msg && Number.isSafeInteger(msg.seq)) unreadBySeq.set(msg.seq, msg);
     }
+    // 顺手把回执裁到仍在未读里的消息，防止状态文件无限增长。
+    const delivered = new Set((Array.isArray(st.inlineMediaSeqs) ? st.inlineMediaSeqs : [])
+      .filter((seq) => unreadBySeq.has(seq)));
+    st.inlineMediaSeqs = [...delivered];
     const media = [];
+    const seqs = [];
     for (const offered of snapshot.messages) {
       if (media.length >= MAX_MEDIA_COUNT) break;
       const seq = offered?.seq;
-      if (!Number.isSafeInteger(seq) || seen.has(seq)) continue;
+      if (!Number.isSafeInteger(seq) || delivered.has(seq)) continue;
       const msg = unreadBySeq.get(seq);
       if (!msg || msg.isSelf || !Array.isArray(msg.media) || msg.media.length === 0) continue;
+      let added = false;
       for (const item of msg.media) {
         if (media.length >= MAX_MEDIA_COUNT) break;
         media.push(item);
+        added = true;
       }
+      if (added) seqs.push(seq);
     }
-    return media;
+    return { media, seqs };
   }
 
   function replyTimingV2(st) {
@@ -11246,6 +11291,7 @@ async function main() {
     const participationText = formatParticipationV2(st);
     const participationLine = participationText ? `${participationText}\n\n` : '';
     const antiAiLine = '【反AI味】你不是客服：不用有求必应，可以装傻、已读乱回、拒绝推荐；少用“一绝/真管用/保证/绝对”这类词。\n\n';
+    const retryStopLine = '【工具失败止损】同一个工具（尤其是 qq_get_message_images）连续失败 2 次就停，不要反复用同样或近似的参数重试；看图失败就直接说“图我这边打不开，你文字说一下”，然后继续正常聊天或收尾。\n\n';
     const stickerCfg = cfg.socialV2?.sticker ?? {};
     const stickerLine = stickerCfg.enabled !== false && stickerCfg.includeInPrompt !== false
       ? `${buildStickerStrategyHint()}\n${buildStickerContext(stickerEntries, stickerCfg.promptMaxStickers ?? 8, key)}\n\n`
@@ -11286,7 +11332,7 @@ async function main() {
     const initialPromptLine = initialPromptText ? `${initialPromptText}\n\n` : '';
     // 时间感放在 base 的最末尾：紧接着就是【唤醒】原因与行动指令，位置最显眼。
     const timeSenseLine = buildTimeSenseLine(st);
-    const base = roleLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine + timeSenseLine;
+    const base = roleLine + identityLine + tokenLine + initialPromptLine + antiAiLine + retryStopLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine + timeSenseLine;
     // 唤醒原因里的那条消息本身多旧：`atMention@seq194` 这种形态能反查到原消息。
     const triggeredSeq = wakeReasonSeq(reason);
     const triggeredMsg = triggeredSeq ? findV2MessageBySeq(st, triggeredSeq) : null;
