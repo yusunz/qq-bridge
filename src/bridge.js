@@ -916,7 +916,11 @@ function loadConfig() {
       media: {
         maxBytes: 8 * 1024 * 1024,
         maxPixels: 64_000_000,
-        maxCount: 5
+        maxCount: 5,
+        // reserved2 唤醒时把「模型还没看过的新消息图片」直接内联进 prompt。
+        // 兜底目的：看图工具（qq_get_message_images）在某些模型/网关下会把 messageId 参数
+        // 传坏（MCP -32602），此时唤醒不附图就等于彻底看不到图。默认开启，可设 false 关闭。
+        inlineWake: true
       },
       ...(file.socialV2 ?? {})
     }
@@ -9888,6 +9892,8 @@ async function main() {
     let wakeState;
     let wakeToken;
     let wakeSnapshot;
+    // 唤醒附图的来源：普通投递用调用方给的媒体列表；reserved2 唤醒则从新消息里兜底收集。
+    let mediaForPrompt = Array.isArray(opts.media) ? opts.media : [];
     if (opts.wakeReason) {
       if (wakeBlocked()) return skipWake();
       // Build only after session creation: retries may rotate the token, and an
@@ -9898,13 +9904,29 @@ async function main() {
       wakeSnapshot = buildWakeSnapshotV2(key);
       if (wakeSnapshot) {
         promptText += `\n\n【本次消息快照】\n${JSON.stringify(wakeSnapshot)}\n以上消息已提供，无需重复查询；partial=true 时用 qq_get_unread_messages(afterSeq=readThroughSeq) 继续读取。先处理当前消息；回复前如需确认后续补充，用 qq_wait_for_messages(purpose="reply") 补足短静默，已安静够久会立即返回，不要先长等。收尾只确认你已处理的 readThroughSeq（本地 seq，非 QQ messageId），传给 qq_mark_read 或 qq_set_wake_config 的 throughSeq；新到消息留待处理。`;
+        // 看图工具的参数会被某些模型传坏（-32602），唤醒时把新消息图片直接内联一份作兜底。
+        // 只在调用方没给媒体时生效，避免重复附图。
+        if (mediaForPrompt.length === 0) mediaForPrompt = collectWakeMediaV2(key, wakeSnapshot);
       }
     }
-    let content = [{ type: 'text', text: withSlangContext(promptText, key) }];
-    if (Array.isArray(opts.media) && opts.media.length > 0) {
-      const imageParts = await resolveMediaList(opts.media);
-      content = [{ type: 'text', text: withSlangContext(promptText, key) }, ...imageParts];
+    let imageParts = [];
+    if (mediaForPrompt.length > 0) {
+      try {
+        imageParts = await resolveMediaList(mediaForPrompt);
+      } catch (error) {
+        // 附图解析失败不能连累唤醒本身：退回纯文本投递，模型仍可调工具或请对方发文字。
+        log(`唤醒附图解析失败，按纯文本投递 (${key}): ${error?.message ?? error}`);
+        imageParts = [];
+      }
     }
+    const attachedCount = imageParts.filter((part) => part && part.type === 'image').length;
+    const inlineHint = opts.wakeReason && attachedCount > 0
+      ? `\n\n【本次唤醒已附图】新消息里的 ${attachedCount} 张图片/表情已直接附在下面，不需要再调用 qq_get_message_images 看这些图；只有附图显示“获取失败”、或你想看别的图时，才按看图说明处理。`
+      : '';
+    const content = [
+      { type: 'text', text: withSlangContext(inlineHint ? promptText + inlineHint : promptText, key) },
+      ...imageParts
+    ];
     // 媒体解析成功后再标记退场，避免解析异常时残留退场标记。
     if (!isCurrentSession(key, sessionId)) throw new Error('投递前会话已重置或权限已变化');
     if (opts.farewell) social.exitingSessions.add(sessionId);
@@ -11120,6 +11142,41 @@ async function main() {
       packet.recent.reverse();
     }
     return packet;
+  }
+
+  // reserved2 的唤醒只给「文本快照 + 看图工具」，图片完全依赖 qq_get_message_images。
+  // 实测某些模型/网关会把该工具的 messageId 参数传坏（MCP -32602 Input validation error），
+  // 此时看图链路整条断掉，模型只能对群友说"看不见图"。这里把**本次快照里、模型还没看过**
+  // 的新消息图片直接内联进唤醒 prompt，作为不依赖工具参数的兜底。
+  //
+  // 边界：
+  //   · 只取 snapshot.messages（本次真正展示给模型的那批未读），不含 recent，避免翻旧账重复烧图；
+  //   · 已在 modelSeenSeqs 里的消息跳过 —— 那是上一轮已经连图一起展示过的，不能每轮重发；
+  //   · 总量受 socialV2.media.maxCount 约束（默认 5 张），单条消息内的多图共享这个额度；
+  //   · socialV2.media.inlineWake=false 可整体关闭（回滚开关，不改代码）。
+  function collectWakeMediaV2(key, snapshot) {
+    if (!snapshot || !Array.isArray(snapshot.messages) || snapshot.messages.length === 0) return [];
+    if (cfg.socialV2?.media?.inlineWake === false) return [];
+    const st = getSocialV2State(key);
+    if (!st) return [];
+    const seen = new Set(st.modelSeenSeqs || []);
+    const unreadBySeq = new Map();
+    for (const msg of Array.isArray(st.unread) ? st.unread : []) {
+      if (msg && Number.isSafeInteger(msg.seq)) unreadBySeq.set(msg.seq, msg);
+    }
+    const media = [];
+    for (const offered of snapshot.messages) {
+      if (media.length >= MAX_MEDIA_COUNT) break;
+      const seq = offered?.seq;
+      if (!Number.isSafeInteger(seq) || seen.has(seq)) continue;
+      const msg = unreadBySeq.get(seq);
+      if (!msg || msg.isSelf || !Array.isArray(msg.media) || msg.media.length === 0) continue;
+      for (const item of msg.media) {
+        if (media.length >= MAX_MEDIA_COUNT) break;
+        media.push(item);
+      }
+    }
+    return media;
   }
 
   function replyTimingV2(st) {

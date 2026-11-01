@@ -266,6 +266,7 @@
       "maxBytes": 8388608,
       "maxPixels": 64000000,
       "maxCount": 5,
+      "inlineWake": true,
       "normalize": true,
       "maxModelBytes": 1048576,
       "maxLongEdge": 1280,
