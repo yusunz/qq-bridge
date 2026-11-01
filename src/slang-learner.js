@@ -311,6 +311,11 @@ export function buildResearchPrompt(candidates) {
     .join('\n');
   return `你是群聊黑话研究员。请针对以下候选网络用语/黑话做**深度联网考究**：先结合给出的群友语境判断可能含义，再使用 web_search 搜索确认，并对最相关的 1~2 个结果用 web_fetch 抓取正文阅读（只读搜索/抓取，不要执行任何本地操作）。不要只依赖搜索摘要。
 
+【搜索预算（硬限制，必须遵守）】
+- 最多调用 web_search 6 次、web_fetch 2 次；总时长控制在 2 分钟内。
+- 不要用近似 query 反复重搜同一个词；每换一次 query 必须有明确的新假设。
+- 预算用完仍无法确认，就立刻输出 confirmed:false、meaning 写“不确定”，然后结束；不要继续搜索，也不要为了凑结果编造含义。
+
 候选：
 ${list}
 

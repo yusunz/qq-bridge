@@ -23,6 +23,9 @@ const tests = [
   'test-md-to-plain.mjs', 'test-slang-learn.mjs', 'test-mux-reconnect.mjs',
   // restart.bat 只能停止经锁/PID 验证的本实例，不能按全机进程名误杀其他项目。
   'test-restart-instance.mjs',
+  // 学习会话超时必须真正取消 DSH turn（否则桥接放弃后模型继续后台烧 token：
+  // 真实事故 57 分钟 / 289 步 / ¥4.25）。
+  'test-slang-turn-cancel.mjs',
   'test-token-economy.mjs', 'test-qq-model-view.mjs', 'test-qq-preset-contract.mjs',
   'test-reply-wait.mjs', 'test-preset-prompt.mjs', 'test-installed-preset-sync.mjs', 'test-role-card.mjs',
   // 角色卡注入节奏：首次/换卡/新会话必须全量，其余只给一行提醒（#118）。

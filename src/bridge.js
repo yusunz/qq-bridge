@@ -2259,6 +2259,16 @@ async function main() {
     try { fs.unlinkSync(SLANG_SESSION_FILE); } catch {}
   }
 
+  // 放弃等待时**必须真正取消** DSH 那边的 turn，否则桥接已经超时、模型还在后台继续跑。
+  // 真实事故：一次黑话研究 turn 在桥接 120s 超时放弃后又跑了 56 分钟 / 289 步 /
+  // 128M token（约 ¥4.25），结果还没人消费。这里统一走 stopSessionWork，失败只记日志。
+  function cancelLearnerTurn(sessionId, reason) {
+    if (!sessionId) return;
+    void withTimeout(api.stopSessionWork(sessionId), DSH_CONTROL_TIMEOUT_MS, 'stopSessionWork')
+      .then(() => log(`已取消学习会话 turn（${reason}）：${sessionId}`))
+      .catch((error) => log(`取消学习会话 turn 失败（${reason}）：${error?.message ?? error}`));
+  }
+
   function waitLearnerTurn(sessionId, timeoutMs = 120000) {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -2267,6 +2277,14 @@ async function main() {
         if (idx >= 0) arr.splice(idx, 1);
         if (arr.length === 0) learnerWaiters.delete(sessionId);
         reject(new Error(`等待学习会话 turn 超时(${timeoutMs}ms)`));
+        // 只有队列里没有别的等待者时才动这个会话：否则会误杀别人正在等的 turn。
+        // 取消后同时丢弃该学习会话，避免“已停止 turn 的结束事件”与下一个 prompt 的
+        // waiter 串在一起（新任务会用新会话，旧会话的事件不再被任何 waiter 匹配）。
+        // 只在当前学习会话就是它时才丢弃：极端并发下别把后来新建的会话一起清了。
+        if (arr.length === 0) {
+          cancelLearnerTurn(sessionId, '等待超时');
+          if (slangLearnerSessionId === sessionId) invalidateSlangLearnerSession();
+        }
       }, timeoutMs);
       const waiter = { resolve, reject, timer };
       const arr = learnerWaiters.get(sessionId) ?? [];

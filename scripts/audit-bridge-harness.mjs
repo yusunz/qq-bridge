@@ -151,7 +151,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
   const setStickerEntries = (next) => { stickerEntries = Array.isArray(next) ? next : []; };
   const getStickerEntries = () => stickerEntries;
   return {
-    syncInstalledPreset, installedPresetYaml, ensureSession, ensureSlangLearnerSession, runSlangResearch, resolvePresetName, deliverPrompt, drainPromptQueue,
+    syncInstalledPreset, installedPresetYaml, ensureSession, ensureSlangLearnerSession, waitLearnerTurn, cancelLearnerTurn, invalidateSlangLearnerSession, learnerWaiters, runSlangResearch, resolvePresetName, deliverPrompt, drainPromptQueue,
     applyHealedTokens, reportTurnFailure, recordVoiceSentV2, rediscoverDshBase,
     getSlangEntries: () => slangEntries,
     completeLearnerTurn(sessionId, output) {

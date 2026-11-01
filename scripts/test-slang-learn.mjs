@@ -40,12 +40,17 @@ function ok(name) {
   ok('parseResearchJson 解析 sources');
 }
 
-// 4. buildResearchPrompt 要求深度联网与 sources
+// 4. buildResearchPrompt 要求深度联网与 sources，并且带硬性搜索预算
 {
   const prompt = buildResearchPrompt([{ content: 'yyds', evidence: [{ text: '这波 yyds' }] }]);
   assert.ok(prompt.includes('web_fetch'), 'prompt 应要求 web_fetch 抓正文');
   assert.ok(prompt.includes('"sources"'), 'prompt 应要求输出 sources');
   assert.ok(prompt.includes('深度联网考究'), 'prompt 应强调深度联网考究');
+  // 真实事故：一次研究 turn 调了 574 次 web_search 跑了 57 分钟。prompt 必须有预算兜底。
+  assert.ok(prompt.includes('搜索预算'), 'prompt 必须声明搜索预算');
+  assert.ok(prompt.includes('最多调用 web_search 6 次'), '必须写明 web_search 次数上限');
+  assert.ok(prompt.includes('2 分钟内'), '必须写明总时长上限');
+  assert.ok(prompt.includes('confirmed:false'), '预算用尽时要求直接给未确认结果');
   ok('buildResearchPrompt 深度研究指令');
 }
 
