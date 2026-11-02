@@ -131,5 +131,72 @@ await test('图片抓取失败不连累唤醒：仍投递纯文本', async () =>
   } finally { await h.close(); }
 });
 
+// ── 运行中（回合进行中）收到图片：用 steer 插进当前回合的下一步 ──────────────
+async function busyBridge(run, config = {}) {
+  await withBridge(async (h) => {
+    const sid = await h.ensureSession(KEY);
+    h.v2TurnStartAt.set(sid, Date.now());
+    try { await run(h, sid); } finally { h.v2TurnStartAt.delete(sid); }
+  }, config);
+}
+
+await test('回合运行中收到图片：steer 插入当前回合，图片直接进上下文', async () => {
+  await busyBridge(async (h) => {
+    const seq = append(h, '[图片]', IMG_MEDIA);
+    const msg = h.getSocialV2State(KEY).unread.at(-1);
+    const before = h.calls.prompts.length;
+    await h.steerInlineMediaV2(KEY, msg);
+    assert.equal(h.calls.prompts.length, before + 1, '运行中必须发一次 steer');
+    const sent = h.calls.prompts.at(-1);
+    assert.equal(sent.mode, 'steer', '必须走 steer 模式（插入当前回合下一步）');
+    const images = sent.content.filter((part) => part?.type === 'image');
+    assert.equal(images.length, 1, 'steer 内容必须带图片');
+    assert.match(String(sent.content[0]?.text), /【运行中附图】/);
+    assert.ok((h.getSocialV2State(KEY).inlineMediaSeqs || []).includes(seq), '成功插入后必须记账');
+    // 记账之后，正常唤醒不应再重复附同一张图
+    await h.deliverPrompt(KEY, '', { wakeReason: 'atMention@seq1' });
+    assert.equal(imageBlocks(h).length, 0, '运行中已附过的图不能在唤醒里重复附');
+  });
+});
+
+await test('回合空闲时不做 steer（交给正常唤醒附图）', async () => {
+  await withBridge(async (h) => {
+    append(h, '[图片]', IMG_MEDIA);
+    await h.ensureSession(KEY);
+    const msg = h.getSocialV2State(KEY).unread.at(-1);
+    const before = h.calls.prompts.length;
+    await h.steerInlineMediaV2(KEY, msg);
+    assert.equal(h.calls.prompts.length, before, '不忙时不该 steer');
+    assert.equal((h.getSocialV2State(KEY).inlineMediaSeqs || []).length, 0);
+  });
+});
+
+await test('inlineSteer=false 可关闭运行中插图（回滚开关）', async () => {
+  await busyBridge(async (h) => {
+    const seq = append(h, '[图片]', IMG_MEDIA);
+    const msg = h.getSocialV2State(KEY).unread.at(-1);
+    const before = h.calls.prompts.length;
+    await h.steerInlineMediaV2(KEY, msg);
+    assert.equal(h.calls.prompts.length, before);
+    assert.ok(!(h.getSocialV2State(KEY).inlineMediaSeqs || []).includes(seq));
+  }, { media: { inlineSteer: false } });
+});
+
+await test('运行中附图抓取失败：不插图、不记账，后续唤醒仍可补', async () => {
+  await busyBridge(async (h) => {
+    h.bot.getImage = async () => { throw new Error('fixture gateway down'); };
+    append(h, '[图片]', IMG_MEDIA);
+    const msg = h.getSocialV2State(KEY).unread.at(-1);
+    const before = h.calls.prompts.length;
+    await h.steerInlineMediaV2(KEY, msg);
+    assert.equal(h.calls.prompts.length, before, '抓不到图就不该发文字-only steer');
+    assert.equal((h.getSocialV2State(KEY).inlineMediaSeqs || []).length, 0);
+    // 恢复网关后，正常唤醒应该把图补上
+    delete h.bot.getImage;
+    await h.deliverPrompt(KEY, '', { wakeReason: 'atMention@seq1' });
+    assert.equal(imageBlocks(h).length, 1, '失败不记账，唤醒仍应补图');
+  });
+});
+
 console.log(`\n${failures ? 'FAILED' : 'ALL PASS'}  tests=${tests} failures=${failures}`);
 process.exitCode = failures ? 1 : 0;

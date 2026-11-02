@@ -267,6 +267,7 @@
       "maxPixels": 64000000,
       "maxCount": 5,
       "inlineWake": true,
+      "inlineSteer": true,
       "normalize": true,
       "maxModelBytes": 1048576,
       "maxLongEdge": 1280,

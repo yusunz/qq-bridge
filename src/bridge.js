@@ -920,7 +920,11 @@ function loadConfig() {
         // reserved2 唤醒时把「模型还没看过的新消息图片」直接内联进 prompt。
         // 兜底目的：看图工具（qq_get_message_images）在某些模型/网关下会把 messageId 参数
         // 传坏（MCP -32602），此时唤醒不附图就等于彻底看不到图。默认开启，可设 false 关闭。
-        inlineWake: true
+        inlineWake: true,
+        // 会话**运行中**收到图片/表情时，用 DSH 的 steer 模式插进当前回合的下一步。
+        // 没有它，图只能等回合结束后的唤醒才附图；而回合里模型已经能看到 media 元数据、
+        // 会先去调坏掉的看图工具（2026-11-02 私聊表情包实证）。默认开启，可设 false 关闭。
+        inlineSteer: true
       },
       ...(file.socialV2 ?? {})
     }
@@ -11242,6 +11246,50 @@ async function main() {
     return { media, seqs };
   }
 
+  // 回合运行中收到的图片/表情：不能等下一次唤醒（回合可能还要跑几分钟；模型在回合里
+  // 已经能从 wait/unread 结果看到 media 元数据，会先去调 qq_get_message_images，而该工具
+  // 在某些模型/网关下参数会被传坏 → 永远看不到图。2026-11-02 私聊表情包实证）。
+  // 这里用 DSH 的 `steer` 模式（插进当前回合的下一步，不打断、不另起回合）把图片喂进去。
+  // 记账口径：只有 DSH 接受后才写 inlineMediaSeqs，避免下一次唤醒重复附图、也避免失败时吞掉重试。
+  async function steerInlineMediaV2(key, message) {
+    try {
+      if (!message || !Array.isArray(message.media) || message.media.length === 0) return;
+      if (cfg.socialV2?.media?.inlineSteer === false) return;
+      if (currentMode !== 'reserved2') return;
+      if (!isConversationBusyV2(key)) return;
+      const sessionId = state.sessions[key];
+      if (!sessionId || !isCurrentSession(key, sessionId)) return;
+      let imageParts = [];
+      try {
+        imageParts = await resolveMediaList(message.media);
+      } catch (error) {
+        log(`[reserved2] 运行中附图解析失败 ${key}: ${error?.message ?? error}`);
+        return;
+      }
+      const attached = imageParts.filter((part) => part && part.type === 'image').length;
+      if (attached === 0) return;
+      const seq = Number.isSafeInteger(message.seq) ? message.seq : null;
+      const ref = message.messageId != null && String(message.messageId).trim() !== ''
+        ? String(message.messageId).trim() : (seq != null ? String(seq) : '');
+      const tail = sanitizeUntrustedText(String(message.text || message.plain || '').slice(0, 100));
+      const text = `【运行中附图】刚收到一条带图片/表情的消息（本地 seq ${seq ?? '?'}，messageId ${ref}）${tail ? `：${tail}` : ''}。图片已直接附在下面，直接看即可；不要为这条消息调用 qq_get_message_images。`;
+      const accepted = await api.sessions.prompt({ sessionId, mode: 'steer', content: [{ type: 'text', text }, ...imageParts] });
+      if (!accepted?.result?.ok) {
+        log(`[reserved2] 运行中附图被拒 ${key}: ${accepted?.result?.error?.code ?? 'unknown'}`);
+        return;
+      }
+      if (seq != null) {
+        const st = getSocialV2State(key);
+        noteInlineMediaSeqsV2(st, [seq]);
+        saveSocialV2State();
+      }
+      log(`[reserved2] 运行中附图已插入 ${key}（seq ${seq ?? '?'}，${attached} 张）`);
+    } catch (error) {
+      // 附图兜底永远不能连累消息入库/唤醒流程。
+      log(`[reserved2] 运行中附图插入失败 ${key}: ${error?.message ?? error}`);
+    }
+  }
+
   function replyTimingV2(st) {
     const minimum = Number(cfg.socialV2?.wait?.minQuietAfterNewMs);
     const minQuietMs = Number.isFinite(minimum) ? Math.max(0, minimum) : 10000;
@@ -11995,6 +12043,11 @@ async function main() {
         return;
       }
       const st = getSocialV2State(key);
+      // 运行中的回合里收到图片/表情：steer 进当前回合下一步，别等回合结束的唤醒。
+      if (Array.isArray(mediaList) && mediaList.length > 0) {
+        const last = st.unread[st.unread.length - 1];
+        if (last) void steerInlineMediaV2(key, last);
+      }
       if (!st.bootstrapSent) {
         st.bootstrapSent = true;
         saveSocialV2State();
