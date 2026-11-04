@@ -47,6 +47,7 @@ function append(h, text, media = []) {
 const lastPromptContent = (h) => h.calls.prompts.at(-1)?.content ?? [];
 const imageBlocks = (h) => lastPromptContent(h).filter((part) => part?.type === 'image');
 const promptText = (h) => lastPromptContent(h).find((part) => part?.type === 'text')?.text ?? '';
+const allPromptText = (h) => lastPromptContent(h).filter((part) => part?.type === 'text').map((part) => String(part.text ?? '')).join('\n');
 
 await test('带图新消息唤醒：图片内联进 prompt，并给出「已附图」提示', async () => {
   await withBridge(async (h) => {
@@ -195,6 +196,88 @@ await test('运行中附图抓取失败：不插图、不记账，后续唤醒�
     delete h.bot.getImage;
     await h.deliverPrompt(KEY, '', { wakeReason: 'atMention@seq1' });
     assert.equal(imageBlocks(h).length, 1, '失败不记账，唤醒仍应补图');
+  });
+});
+
+// ── 同图去重（按模型看到的字节哈希；只附一次，其余文本引用）─────────────────
+const PNG_A = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+k3ioAAAAASUVORK5CYII=';
+const PNG_B = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+const MEDIA_A = [{ kind: 'image', file: 'a.jpg' }];
+const MEDIA_B = [{ kind: 'image', file: 'b.jpg' }];
+function twoImages(h) {
+  h.bot.getImage = async ({ file }) => ({ base64: String(file).includes('b') ? PNG_B : PNG_A });
+}
+
+await test('同一次唤醒里两条消息是同一张图：只附一张，另一条换成文本引用', async () => {
+  await withBridge(async (h) => {
+    twoImages(h);
+    append(h, '[图片]', MEDIA_A);
+    append(h, '[图片]', MEDIA_A);
+    await h.deliverPrompt(KEY, '', { wakeReason: 'atMention@seq1' });
+    assert.equal(imageBlocks(h).length, 1, '同一张图只应附一次');
+    assert.match(allPromptText(h), /同一张图片\/表情此前已附过/, '重复的图应变成文本引用');
+    const seen = h.getSocialV2State(KEY).mediaSeen || {};
+    assert.equal(Object.keys(seen).length, 1, '只记一个哈希');
+  });
+});
+
+await test('后续唤醒再收到同一张图：不重复附图，只给文本引用', async () => {
+  await withBridge(async (h) => {
+    twoImages(h);
+    append(h, '[图片]', MEDIA_A);
+    await h.deliverPrompt(KEY, '', { wakeReason: 'atMention@seq1' });
+    assert.equal(imageBlocks(h).length, 1);
+    append(h, '[图片]', MEDIA_A); // 新 seq、同内容
+    await h.deliverPrompt(KEY, '', { wakeReason: 'probability@seq1' });
+    assert.equal(imageBlocks(h).length, 0, '同图不该重复附');
+    assert.match(allPromptText(h), /此前已附过/);
+  });
+});
+
+await test('不同内容的图：两张都附图', async () => {
+  await withBridge(async (h) => {
+    twoImages(h);
+    append(h, '[图片]', MEDIA_A);
+    append(h, '[图片]', MEDIA_B);
+    await h.deliverPrompt(KEY, '', { wakeReason: 'atMention@seq1' });
+    assert.equal(imageBlocks(h).length, 2, '不同哈希应各附一张');
+  });
+});
+
+await test('上下文压缩（compactionEpoch 变化）后：同一张图允许重新附', async () => {
+  await withBridge(async (h) => {
+    twoImages(h);
+    append(h, '[图片]', MEDIA_A);
+    await h.deliverPrompt(KEY, '', { wakeReason: 'atMention@seq1' });
+    assert.equal(imageBlocks(h).length, 1);
+    h.getSocialV2State(KEY).compactionEpoch = 1; // 模拟收到 compaction/start
+    append(h, '[图片]', MEDIA_A);
+    await h.deliverPrompt(KEY, '', { wakeReason: 'probability@seq1' });
+    assert.equal(imageBlocks(h).length, 1, '压缩后旧账失效，应重新附图');
+  });
+});
+
+await test('dedupeByHash=false 可关闭同图去重（回滚开关）', async () => {
+  await withBridge(async (h) => {
+    twoImages(h);
+    append(h, '[图片]', MEDIA_A);
+    append(h, '[图片]', MEDIA_A);
+    await h.deliverPrompt(KEY, '', { wakeReason: 'atMention@seq1' });
+    assert.equal(imageBlocks(h).length, 2, '关闭去重后同图也各附一张');
+  }, { media: { dedupeByHash: false } });
+});
+
+await test('抓图失败不写去重账本：恢复后同一张图仍可附', async () => {
+  await withBridge(async (h) => {
+    twoImages(h);
+    h.bot.getImage = async () => { throw new Error('fixture gateway down'); };
+    const seq = append(h, '[图片]', MEDIA_A);
+    await h.deliverPrompt(KEY, '', { wakeReason: 'atMention@seq1' });
+    assert.equal(imageBlocks(h).length, 0);
+    assert.equal(Object.keys(h.getSocialV2State(KEY).mediaSeen || {}).length, 0, '失败不能记哈希');
+    twoImages(h);
+    await h.deliverPrompt(KEY, '', { wakeReason: 'probability@seq1' });
+    assert.equal(imageBlocks(h).length, 1, '失败不记账，唤醒应重试附图');
   });
 });
 

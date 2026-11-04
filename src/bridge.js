@@ -924,7 +924,11 @@ function loadConfig() {
         // 会话**运行中**收到图片/表情时，用 DSH 的 steer 模式插进当前回合的下一步。
         // 没有它，图只能等回合结束后的唤醒才附图；而回合里模型已经能看到 media 元数据、
         // 会先去调坏掉的看图工具（2026-11-02 私聊表情包实证）。默认开启，可设 false 关闭。
-        inlineSteer: true
+        inlineSteer: true,
+        // 按「模型实际看到的字节」哈希去重：同一个会话、同一代上下文里，
+        // 同一张图只附一次，后续用文本引用（省掉大段 context 的缓存未命中）。
+        // 代际 = sessionId + compactionEpoch：换会话或上下文压缩后自动允许重附。
+        dedupeByHash: true
       },
       ...(file.socialV2 ?? {})
     }
@@ -8459,10 +8463,23 @@ async function main() {
     return { text: fallbackText };
   }
 
-  async function resolveMediaList(mediaList) {
+  async function resolveMediaList(mediaList, opts = {}) {
     const parts = [];
     let index = 0;
     let totalBytes = 0;
+    // 可选钩子：允许调用方在图片 part 入列前替换它（同图去重时换成文本引用）。
+    // 钩子抛错/返回空时退回原图片 —— 媒体管线不能因为去重逻辑出错而丢图。
+    const emitImage = (imagePart, media, mediaIndex) => {
+      let mapped = imagePart;
+      if (typeof opts?.mapImage === 'function') {
+        try { mapped = opts.mapImage(imagePart, { media, index: mediaIndex }); } catch { mapped = imagePart; }
+      }
+      if (Array.isArray(mapped)) {
+        for (const part of mapped) if (part) parts.push(part);
+      } else if (mapped) {
+        parts.push(mapped);
+      }
+    };
     for (const media of Array.isArray(mediaList) ? mediaList : []) {
       index += 1;
       if (index > MAX_MEDIA_COUNT) {
@@ -8481,7 +8498,7 @@ async function main() {
           totalBytes += prep.buffer.length;
           if (face.text) parts.push({ type: 'text', text: face.text });
           if (prep.note) parts.push({ type: 'text', text: `（${prep.note}）` });
-          parts.push({ type: 'image', mediaType: prep.mimeType, data: prep.buffer.toString('base64'), name: `face-${media.faceId}.${(prep.mimeType || 'png').split('/')[1]}` });
+          emitImage({ type: 'image', mediaType: prep.mimeType, data: prep.buffer.toString('base64'), name: `face-${media.faceId}.${(prep.mimeType || 'png').split('/')[1]}` }, media, index);
         } else if (prep && !prep.ok) {
           // 压不到可用体积：明确说明原因，别让模型对着「（获取失败）」瞎猜。
           parts.push({ type: 'text', text: `[表情${index}（${prep.error}）]` });
@@ -8502,7 +8519,7 @@ async function main() {
           totalBytes += prep.buffer.length;
           parts.push({ type: 'text', text: label });
           if (prep.note) parts.push({ type: 'text', text: `（${prep.note}）` });
-          parts.push({ type: 'image', mediaType: prep.mimeType, data: prep.buffer.toString('base64'), name: `qq-${sticker ? 'sticker' : 'image'}-${index}.${(prep.mimeType || 'image/jpeg').split('/')[1]}` });
+          emitImage({ type: 'image', mediaType: prep.mimeType, data: prep.buffer.toString('base64'), name: `qq-${sticker ? 'sticker' : 'image'}-${index}.${(prep.mimeType || 'image/jpeg').split('/')[1]}` }, media, index);
         } else if (prep && !prep.ok) {
           parts.push({ type: 'text', text: `${label}（${prep.error}）` });
         } else {
@@ -9209,6 +9226,10 @@ async function main() {
         lastReadThroughSeq: 0,
         modelSeenSeqs: new Set(),
         inlineMediaSeqs: [],
+        // 上下文代际：DSH 发生 compaction 时 +1；换会话时 sessionId 本身变化。
+        compactionEpoch: 0,
+        // 内容哈希 → { gen, seq, messageId, summary, at, count }，用于“同图只附一次”。
+        mediaSeen: {},
         activeTopics: [],
         pendingThoughts: [],
         memberImpressions: {}
@@ -9284,6 +9305,23 @@ async function main() {
             // 因为文本被工具返回过 ≠ 图片字节给过模型（见 collectWakeMediaV2 注释）。
             inlineMediaSeqs: Array.isArray(val.inlineMediaSeqs)
               ? val.inlineMediaSeqs.filter((seq) => Number.isSafeInteger(seq) && seq > 0) : [],
+            compactionEpoch: Math.max(0, Math.floor(Number(val.compactionEpoch) || 0)),
+            mediaSeen: (() => {
+              const out = {};
+              const raw = val.mediaSeen && typeof val.mediaSeen === 'object' && !Array.isArray(val.mediaSeen) ? val.mediaSeen : {};
+              for (const [hash, rec] of Object.entries(raw)) {
+                if (!/^sha256:[0-9a-f]{64}$/.test(hash) || !rec || typeof rec !== 'object') continue;
+                out[hash] = {
+                  gen: String(rec.gen ?? ''),
+                  seq: Number.isSafeInteger(rec.seq) ? rec.seq : null,
+                  messageId: rec.messageId != null ? String(rec.messageId) : null,
+                  summary: String(rec.summary ?? '').slice(0, 40),
+                  at: Number(rec.at) || 0,
+                  count: Number(rec.count) || 1
+                };
+              }
+              return out;
+            })(),
             activeTopics: Array.isArray(val.activeTopics) ? val.activeTopics : [],
             pendingThoughts: Array.isArray(val.pendingThoughts) ? val.pendingThoughts : [],
             memberImpressions: (() => {
@@ -9372,6 +9410,14 @@ async function main() {
           lastUnreadSeq: st.lastUnreadSeq || 0,
           lastReadThroughSeq: st.lastReadThroughSeq || 0,
           inlineMediaSeqs: (Array.isArray(st.inlineMediaSeqs) ? st.inlineMediaSeqs : []).slice(-100),
+          compactionEpoch: Math.max(0, Math.floor(Number(st.compactionEpoch) || 0)),
+          mediaSeen: (() => {
+            const entries = Object.entries(st.mediaSeen && typeof st.mediaSeen === 'object' ? st.mediaSeen : {})
+              .filter(([hash]) => /^sha256:[0-9a-f]{64}$/.test(hash))
+              .sort((a, b) => (Number(a[1]?.at) || 0) - (Number(b[1]?.at) || 0))
+              .slice(-200);
+            return Object.fromEntries(entries);
+          })(),
           activeTopics: Array.isArray(st.activeTopics) ? st.activeTopics.slice(-50) : [],
           pendingThoughts: Array.isArray(st.pendingThoughts) ? st.pendingThoughts.slice(-50) : [],
           memberImpressions: st.memberImpressions && typeof st.memberImpressions === 'object' ? st.memberImpressions : {},
@@ -9924,6 +9970,8 @@ async function main() {
     let mediaForPrompt = Array.isArray(opts.media) ? opts.media : [];
     // 本次实际挑中、准备内联的消息 seq，投递被接受后才记为“已内联附图”。
     let inlineMediaSeqs = [];
+    // 与 mediaForPrompt 一一对应的来源消息（用于同图去重时写文本引用/记账）。
+    let mediaOwners = [];
     if (opts.wakeReason) {
       if (wakeBlocked()) return skipWake();
       // Build only after session creation: retries may rotate the token, and an
@@ -9940,17 +9988,52 @@ async function main() {
           const picked = collectWakeMediaV2(key, wakeSnapshot);
           mediaForPrompt = picked.media;
           inlineMediaSeqs = picked.seqs;
+          mediaOwners = picked.owners || [];
         }
       }
     }
     let imageParts = [];
+    // 同图去重：同一代上下文里同一张图只附一次；命中时在该消息位置替换成文本引用。
+    // 记账分两笔：handledMediaSeqs（这条消息的图处理过，失败不记）与 pendingMediaSeen
+    // （这次真的附图给模型看的哈希，只有投递被接受后才写）。
+    let handledMediaSeqs = [];
+    let pendingMediaSeen = [];
+    let mediaGen = '';
     if (mediaForPrompt.length > 0) {
+      const dedupe = opts.wakeReason && cfg.socialV2?.media?.dedupeByHash !== false;
+      let resolveOpts;
+      const dedupeHandledSeqs = new Set();
+      const dedupePending = [];
+      if (dedupe) {
+        mediaGen = mediaContextGenV2(key);
+        const localHashes = new Set();
+        resolveOpts = {
+          mapImage: (part, ctx) => {
+            const owner = mediaOwners[Number(ctx?.index) - 1] || null;
+            const hash = hashImagePart(part);
+            // 哈希失败 → 保持附图（宁可不省，不能漏图）
+            if (!hash) return part;
+            if (localHashes.has(hash) || isMediaSeenV2(wakeState, mediaGen, hash)) {
+              if (owner?.seq != null) dedupeHandledSeqs.add(owner.seq);
+              return { type: 'text', text: `[同一张图片/表情此前已附过${owner?.seq != null ? `（seq ${owner.seq}）` : ''}，不再重复附图]` };
+            }
+            localHashes.add(hash);
+            if (owner?.seq != null) dedupeHandledSeqs.add(owner.seq);
+            dedupePending.push({ hash, seq: owner?.seq ?? null, messageId: owner?.messageId ?? null, summary: owner?.summary ?? '', at: Date.now() });
+            return part;
+          }
+        };
+      }
       try {
-        imageParts = await resolveMediaList(mediaForPrompt);
+        imageParts = await resolveMediaList(mediaForPrompt, resolveOpts);
       } catch (error) {
         // 附图解析失败不能连累唤醒本身：退回纯文本投递，模型仍可调工具或请对方发文字。
         log(`唤醒附图解析失败，按纯文本投递 (${key}): ${error?.message ?? error}`);
         imageParts = [];
+      }
+      if (dedupe) {
+        handledMediaSeqs = [...dedupeHandledSeqs];
+        pendingMediaSeen = dedupePending;
       }
     }
     const attachedCount = imageParts.filter((part) => part && part.type === 'image').length;
@@ -9984,12 +10067,14 @@ async function main() {
       // Acceptance grants visibility, never acknowledgement. New arrivals and
       // rejected/stale deliveries must not be cleared by an old cursor.
       noteModelMessagesV2(wakeState, [...wakeSnapshot.messages, ...wakeSnapshot.recent]);
-      // 只有投递被接受（图片确实会进入上下文）才记“已内联附图”：
-      // 全部抓取失败或被拒时不记，下一轮唤醒还能重试。
-      if (attachedCount > 0 && inlineMediaSeqs.length > 0) {
-        noteInlineMediaSeqsV2(wakeState, inlineMediaSeqs);
-        saveSocialV2State();
-      }
+      // 只有投递被接受（图片确实会进入上下文）才记账：
+      // 抓图失败/被拒时不记，下一轮唤醒还能重试。
+      const seqsToNote = handledMediaSeqs.length > 0
+        ? handledMediaSeqs
+        : (attachedCount > 0 ? inlineMediaSeqs : []);
+      if (seqsToNote.length > 0) noteInlineMediaSeqsV2(wakeState, seqsToNote);
+      if (pendingMediaSeen.length > 0) noteMediaSeenV2(wakeState, mediaGen, pendingMediaSeen);
+      if (seqsToNote.length > 0 || pendingMediaSeen.length > 0) saveSocialV2State();
     }
     if (accepted.result.value.command?.text && !opts.silent && currentMode !== 'reserved2') {
       if (opts.farewell) social.exitingSessions.delete(sessionId);
@@ -11036,6 +11121,65 @@ async function main() {
     st.inlineMediaSeqs = [...merged];
   }
 
+  // ── 同图去重：按「模型实际看到的字节」哈希，同一代上下文里只附一次 ──────────
+  //
+  // 为什么必须按归一化后的字节算：同一张图会被 QQ 重新编码/缩放，原始字节不同，
+  // 但模型看到的像素一样 —— 按原始文件哈希会去重失败。
+  // 代际 = sessionId + compactionEpoch：换会话（重建）或上下文压缩后，旧图可能已经
+  // 不在模型的上下文里，代际不匹配即视为“没见过”，允许重新附。
+  const MEDIA_SEEN_MAX = 200;
+
+  /** 给一张已归一化的 image part 算内容哈希；算不出来返回 ''（调用方应保持附图）。 */
+  function hashImagePart(part) {
+    try {
+      if (!part || !part.data || !part.mediaType) return '';
+      const digest = crypto.createHash('sha256')
+        .update(String(part.mediaType))
+        .update('\n')
+        .update(Buffer.from(String(part.data), 'base64'))
+        .digest('hex');
+      return `sha256:${digest}`;
+    } catch {
+      return '';
+    }
+  }
+
+  /** 当前上下文代际：会话 id + 压缩纪元。任何一项变化都让旧去重记录失效。 */
+  function mediaContextGenV2(key) {
+    const st = getSocialV2State(key);
+    const sessionId = state.sessions[key] || '';
+    return `${sessionId}|${Math.max(0, Math.floor(Number(st?.compactionEpoch) || 0))}`;
+  }
+
+  function isMediaSeenV2(st, gen, hash) {
+    if (!st || !hash || !st.mediaSeen || typeof st.mediaSeen !== 'object') return false;
+    const rec = st.mediaSeen[hash];
+    return Boolean(rec && String(rec.gen) === String(gen));
+  }
+
+  /** 记下“这些图当前上下文里已经有了”；只有投递被接受后才调用。 */
+  function noteMediaSeenV2(st, gen, entries) {
+    if (!st || !Array.isArray(entries) || entries.length === 0 || !gen) return;
+    if (!st.mediaSeen || typeof st.mediaSeen !== 'object' || Array.isArray(st.mediaSeen)) st.mediaSeen = {};
+    for (const entry of entries) {
+      if (!entry || typeof entry.hash !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(entry.hash)) continue;
+      const prev = st.mediaSeen[entry.hash];
+      st.mediaSeen[entry.hash] = {
+        gen: String(gen),
+        seq: Number.isSafeInteger(entry.seq) ? entry.seq : null,
+        messageId: entry.messageId != null ? String(entry.messageId) : null,
+        summary: String(entry.summary ?? '').slice(0, 40),
+        at: Number(entry.at) || Date.now(),
+        count: (Number(prev?.count) || 0) + 1
+      };
+    }
+    const hashes = Object.keys(st.mediaSeen);
+    if (hashes.length > MEDIA_SEEN_MAX) {
+      hashes.sort((a, b) => (Number(st.mediaSeen[a]?.at) || 0) - (Number(st.mediaSeen[b]?.at) || 0));
+      for (const hash of hashes.slice(0, hashes.length - MEDIA_SEEN_MAX)) delete st.mediaSeen[hash];
+    }
+  }
+
   function requestedReadThroughSeqV2(st, body, isAgent) {
     if (!Object.prototype.hasOwnProperty.call(body, 'throughSeq')) return null;
     const seq = body.throughSeq;
@@ -11214,7 +11358,7 @@ async function main() {
   //   · socialV2.media.inlineWake=false 可整体关闭（回滚开关，不改代码）。
   // 返回 { media, seqs }：seqs 是本次实际挑中、待附图的消息 seq，投递被接受后才记账。
   function collectWakeMediaV2(key, snapshot) {
-    const empty = { media: [], seqs: [] };
+    const empty = { media: [], seqs: [], owners: [] };
     if (!snapshot || !Array.isArray(snapshot.messages) || snapshot.messages.length === 0) return empty;
     if (cfg.socialV2?.media?.inlineWake === false) return empty;
     const st = getSocialV2State(key);
@@ -11229,6 +11373,7 @@ async function main() {
     st.inlineMediaSeqs = [...delivered];
     const media = [];
     const seqs = [];
+    const owners = [];
     for (const offered of snapshot.messages) {
       if (media.length >= MAX_MEDIA_COUNT) break;
       const seq = offered?.seq;
@@ -11239,11 +11384,12 @@ async function main() {
       for (const item of msg.media) {
         if (media.length >= MAX_MEDIA_COUNT) break;
         media.push(item);
+        owners.push({ seq, messageId: msg.messageId ?? null, summary: item?.summary || '', kind: item?.kind || 'image' });
         added = true;
       }
       if (added) seqs.push(seq);
     }
-    return { media, seqs };
+    return { media, seqs, owners };
   }
 
   // 回合运行中收到的图片/表情：不能等下一次唤醒（回合可能还要跑几分钟；模型在回合里
@@ -11259,18 +11405,38 @@ async function main() {
       if (!isConversationBusyV2(key)) return;
       const sessionId = state.sessions[key];
       if (!sessionId || !isCurrentSession(key, sessionId)) return;
+      const seq = Number.isSafeInteger(message.seq) ? message.seq : null;
+      const ref = message.messageId != null && String(message.messageId).trim() !== ''
+        ? String(message.messageId).trim() : (seq != null ? String(seq) : '');
+      // 同图去重：同一代上下文里已经附过的图不再 steer（那一整段 200~350K 的
+      // 缓存未命中就是白烧），直接跳过这次运行中插图。
+      const st = getSocialV2State(key);
+      const mediaGen = mediaContextGenV2(key);
+      const localHashes = new Set();
+      const pendingMediaSeen = [];
       let imageParts = [];
       try {
-        imageParts = await resolveMediaList(message.media);
+        imageParts = await resolveMediaList(message.media, {
+          mapImage: (part) => {
+            const hash = hashImagePart(part);
+            if (!hash) return part; // 哈希失败 → 保持附图，绝不漏图
+            if (localHashes.has(hash) || isMediaSeenV2(st, mediaGen, hash)) {
+              return { type: 'text', text: '[同一张图片/表情此前已附过，不再重复附图]' };
+            }
+            localHashes.add(hash);
+            pendingMediaSeen.push({ hash, seq, messageId: message.messageId ?? null, summary: message.media?.[0]?.summary ?? '', at: Date.now() });
+            return part;
+          }
+        });
       } catch (error) {
         log(`[reserved2] 运行中附图解析失败 ${key}: ${error?.message ?? error}`);
         return;
       }
       const attached = imageParts.filter((part) => part && part.type === 'image').length;
-      if (attached === 0) return;
-      const seq = Number.isSafeInteger(message.seq) ? message.seq : null;
-      const ref = message.messageId != null && String(message.messageId).trim() !== ''
-        ? String(message.messageId).trim() : (seq != null ? String(seq) : '');
+      if (attached === 0) {
+        log(`[reserved2] 运行中附图跳过 ${key}（seq ${seq ?? '?'}）：同一张图已在上下文里或抓图失败`);
+        return;
+      }
       const tail = sanitizeUntrustedText(String(message.text || message.plain || '').slice(0, 100));
       const text = `【运行中附图】刚收到一条带图片/表情的消息（本地 seq ${seq ?? '?'}，messageId ${ref}）${tail ? `：${tail}` : ''}。图片已直接附在下面，直接看即可；不要为这条消息调用 qq_get_message_images。`;
       const accepted = await api.sessions.prompt({ sessionId, mode: 'steer', content: [{ type: 'text', text }, ...imageParts] });
@@ -11278,11 +11444,9 @@ async function main() {
         log(`[reserved2] 运行中附图被拒 ${key}: ${accepted?.result?.error?.code ?? 'unknown'}`);
         return;
       }
-      if (seq != null) {
-        const st = getSocialV2State(key);
-        noteInlineMediaSeqsV2(st, [seq]);
-        saveSocialV2State();
-      }
+      if (seq != null) noteInlineMediaSeqsV2(st, [seq]);
+      if (pendingMediaSeen.length > 0) noteMediaSeenV2(st, mediaGen, pendingMediaSeen);
+      if (seq != null || pendingMediaSeen.length > 0) saveSocialV2State();
       log(`[reserved2] 运行中附图已插入 ${key}（seq ${seq ?? '?'}，${attached} 张）`);
     } catch (error) {
       // 附图兜底永远不能连累消息入库/唤醒流程。
@@ -12463,6 +12627,17 @@ async function main() {
             // Token 记账放在最前面：无论会话是否仍属当前模式/是否学习会话，
             // 花掉的钱都是真的，都必须入账（归属由 resolveKey 决定）。
             recordSessionUsage(frame.sessionId, frame.event);
+            // 上下文压缩后旧图可能只剩摘要：提升该会话的媒体去重代际，
+            // 让后续再出现的同一张图可以重新附图（不漏图）。
+            if (frame.event?.type === 'compaction/start') {
+              const compactedKey = reverse.get(frame.sessionId);
+              if (compactedKey) {
+                const compactedState = getSocialV2State(compactedKey);
+                compactedState.compactionEpoch = Math.max(0, Math.floor(Number(compactedState.compactionEpoch) || 0)) + 1;
+                saveSocialV2State();
+                log(`[reserved2] 上下文已压缩，媒体去重代际重置 ${compactedKey}（epoch=${compactedState.compactionEpoch}）`);
+              }
+            }
             const key = reverse.get(frame.sessionId);
             if (!key) {
               // 黑话学习会话：只收集 turn，不发送 QQ，并唤醒等待中的学习任务。
